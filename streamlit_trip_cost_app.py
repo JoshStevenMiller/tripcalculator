@@ -267,8 +267,8 @@ def init_advanced_rows(n: int = 3):
 
 # ---------- UI setup ----------
 
-st.set_page_config(page_title="Trip Cost Calculator", page_icon="🪖", layout="wide")
-st.title("🪖 Travel / Orders Cost Calculator")
+st.set_page_config(page_title="Trip Cost Calculator", page_icon="🛄", layout="wide")
+st.title("US Military Travel / Orders Cost Calculator")
 st.caption(
     "Simple mode: Standard CONUS + approximate pay per rank.  "
     "Advanced mode: FY26 seasonal per diem + exact pay by years-of-service."
