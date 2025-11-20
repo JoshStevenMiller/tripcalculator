@@ -12,6 +12,8 @@
 #     * Uses FY26_RATES from fy26_rates.py (STATE/DESTINATION with seasons).
 #     * User enters: travel start/end date, state, destination,
 #       rank, years-of-service, people, rental flags.
+#     * Each line can now have its own Home ZIP and Dest ZIP
+#       (with an option to default to the global DTS ZIPs).
 #
 # Both modes:
 #     * Airfare: # Travelers × $410.
@@ -19,8 +21,10 @@
 #           - Global override: cars × $50 × days, OR
 #           - Per-line: 1 car per checked line × that line's days (simple)
 #             or × trip days (advanced).
-#     * Shows ZIP→ZIP mileage (info only).
-#     * Produces Excel export (RLAS Lines, DTS Summary, Overview).
+#     * Shows ZIP→ZIP mileage (info only in Simple;
+#       Advanced also estimates POV mileage cost per line).
+#     * Produces Excel export (RLAS Lines, DTS Summary, Overview,
+#       and Mileage Detail in Advanced).
 #
 # Requirements:
 #   streamlit
@@ -70,6 +74,31 @@ RANK_TO_MONTHLY_SIMPLE: Dict[str, float] = {
 }
 ALL_RANKS: List[str] = list(RANK_TO_MONTHLY_SIMPLE.keys())
 
+# Map rank text from report ("CPT", "SGT", etc.) to paygrades ("O3", "E5", etc.)
+RANK_TEXT_TO_PAYGRADE: Dict[str, str] = {
+    "PVT": "E1", "PV1": "E1", "E1": "E1",
+    "PV2": "E2", "E2": "E2",
+    "PFC": "E3", "E3": "E3",
+    "SPC": "E4", "CPL": "E4", "E4": "E4",
+    "SGT": "E5", "E5": "E5",
+    "SSG": "E6", "E6": "E6",
+    "SFC": "E7", "E7": "E7",
+    "MSG": "E8", "1SG": "E8", "E8": "E8",
+    "SGM": "E9", "CSM": "E9", "SMA": "E9", "E9": "E9",
+    "WO1": "W1", "WO": "W1",
+    "CW2": "W2", "CW3": "W3", "CW4": "W4", "CW5": "W5",
+    "2LT": "O1", "O1": "O1",
+    "1LT": "O2", "O2": "O2",
+    "CPT": "O3", "O3": "O3",
+    "MAJ": "O4", "O4": "O4",
+    "LTC": "O5", "O5": "O5",
+    "COL": "O6", "O6": "O6",
+    "BG": "O7", "BGEN": "O7", "O7": "O7",
+    "MG": "O8", "O8": "O8",
+    "LTG": "O9", "O9": "O9",
+    "GEN": "O10", "O10": "O10",
+}
+
 # Standard CONUS (used in Simple mode)
 STANDARD_CONUS_LODGING = 110.0
 STANDARD_CONUS_MIE = 68.0
@@ -77,6 +106,9 @@ STANDARD_CONUS_MIE = 68.0
 # DTS fixed rates
 AIRFARE_RATE = 410.0  # per traveler
 RENTAL_RATE = 50.0    # per car per day
+
+# Approx POV mileage rate (you can adjust this to the current JTR rate).
+POV_MILE_RATE = 0.21  # $ per mile (round-trip assumed in Advanced mode)
 
 
 # ---------- Helpers: generic ----------
@@ -259,10 +291,72 @@ def init_simple_rows(n: int = 3):
 def init_advanced_rows(n: int = 3):
     if "rows_adv" not in st.session_state:
         st.session_state.rows_adv = [
-            {"rank": "E4", "yos": 4, "people": 1, "rental": False},
-            {"rank": "E5", "yos": 6, "people": 1, "rental": False},
-            {"rank": "O1", "yos": 2, "people": 1, "rental": False},
+            {"rank": "E4", "yos": 4, "people": 1, "rental": False, "home_zip": "", "dest_zip": ""},
+            {"rank": "E5", "yos": 6, "people": 1, "rental": False, "home_zip": "", "dest_zip": ""},
+            {"rank": "O1", "yos": 2, "people": 1, "rental": False, "home_zip": "", "dest_zip": ""},
         ][:n]
+
+
+def excel_to_adv_rows(uploaded_file) -> List[dict]:
+    """
+    Parse a SELRES Travel Distance Ad Hoc Excel export and turn it into
+    a list of advanced-mode rows: rank, YOS, home/dest ZIPs, etc.
+    Expects headers like: 'UPC', 'Unit Name', 'RCC', 'Soldier Name',
+    'Rank', 'Home ZIP Code', 'Unit ZIP Code', 'Years Creditable Service'.
+    """
+    df_raw = pd.read_excel(uploaded_file, header=None)
+
+    header_row_idx = None
+    for idx, row in df_raw.iterrows():
+        values = [str(v).strip() if not pd.isna(v) else "" for v in row.tolist()]
+        if "UPC" in values and "Soldier Name" in values and "Home ZIP Code" in values:
+            header_row_idx = idx
+            break
+
+    if header_row_idx is None:
+        raise ValueError(
+            "Could not find header row in Excel template "
+            "(expected columns like 'UPC', 'Soldier Name', 'Home ZIP Code')."
+        )
+
+    header = df_raw.iloc[header_row_idx].tolist()
+    data = df_raw.iloc[header_row_idx + 1 :].copy()
+    data.columns = header
+
+    # Keep only actual Soldier rows
+    data = data[data["Soldier Name"].notna()].reset_index(drop=True)
+
+    rows: List[dict] = []
+    for _, r in data.iterrows():
+        rank_text = str(r.get("Rank", "")).strip().upper()
+        paygrade = RANK_TEXT_TO_PAYGRADE.get(rank_text)
+        if not paygrade:
+            # Skip rows where we can't map the rank
+            continue
+
+        yos_raw = r.get("Years Creditable Service", 0)
+        try:
+            yos = int(float(yos_raw))
+        except Exception:
+            yos = 0
+
+        home_zip = str(r.get("Home ZIP Code", "")).strip()
+        dest_zip = str(r.get("Unit ZIP Code", "")).strip()
+        name = str(r.get("Soldier Name", "")).strip()
+
+        rows.append(
+            {
+                "rank": paygrade,
+                "yos": yos,
+                "people": 1,
+                "rental": False,
+                "home_zip": home_zip,
+                "dest_zip": dest_zip,
+                "name": name,
+            }
+        )
+
+    return rows
 
 
 # ---------- UI setup ----------
@@ -504,17 +598,51 @@ with tab_advanced:
         help="Applied based on full trip dates (not per line).",
     )
 
+    # Use global DTS zips as defaults for line home/dest zips
+    use_global_zips_adv = st.checkbox(
+        "Use Global DTS ZIPs as defaults for line home/destination ZIPs",
+        value=True,
+        help="When checked, blank line ZIPs are auto-filled from the Global DTS Origin/Destination ZIPs.",
+    )
+
+    # Excel upload to auto-populate advanced lines
+    upload_col1, upload_col2 = st.columns([2, 1])
+    with upload_col1:
+        uploaded_report = st.file_uploader(
+            "Upload SELRES Travel Distance Excel report",
+            type=["xlsx", "xls"],
+            key="adv_excel",
+        )
+    with upload_col2:
+        st.markdown(
+            "Optional: Upload your SELRES Travel Distance Ad Hoc report to "
+            "auto-fill travelers (rank, YOS, home/unit ZIPs)."
+        )
+
+    if uploaded_report is not None and st.button("📂 Load travelers from Excel", use_container_width=True):
+        try:
+            new_rows = excel_to_adv_rows(uploaded_report)
+            if not new_rows:
+                st.warning("No valid traveler rows found in uploaded Excel file.")
+            else:
+                st.session_state.rows_adv = new_rows
+                st.success(f"Loaded {len(new_rows)} traveler(s) from Excel.")
+        except Exception as e:
+            st.error(f"Error parsing Excel file: {e}")
+
     leftA, rightA = st.columns([3, 1])
     with rightA:
         if st.button("➕ Add line (advanced)", use_container_width=True):
-            st.session_state.rows_adv.append({"rank": "E4", "yos": 4, "people": 1, "rental": False})
+            st.session_state.rows_adv.append(
+                {"rank": "E4", "yos": 4, "people": 1, "rental": False, "home_zip": "", "dest_zip": ""}
+            )
         if st.button("♻️ Reset lines (advanced)", use_container_width=True):
             st.session_state.rows_adv = []
             init_advanced_rows(3)
 
     with leftA:
         for i, row in enumerate(st.session_state.rows_adv):
-            c1, c2, c3, c4, c5 = st.columns([1.3, 1, 1, 1.2, 0.4])
+            c1, c2, c3, c4, c5, c6, c7 = st.columns([1.3, 1, 1, 1.1, 1.1, 1.1, 0.4])
             with c1:
                 st.session_state.rows_adv[i]["rank"] = st.selectbox(
                     f"Rank (line {i+1})",
@@ -533,11 +661,33 @@ with tab_advanced:
             with c4:
                 st.session_state.rows_adv[i]["rental"] = st.checkbox(
                     "Rental car (info)",
-                    value=bool(row["rental"]),
+                    value=bool(row.get("rental", False)),
                     key=f"a_rental_{i}",
                     help="Used only if global cars=0.",
                 )
             with c5:
+                default_home = row.get("home_zip", "")
+                if use_global_zips_adv and not default_home:
+                    default_home = origin_zip
+                home_zip_val = st.text_input(
+                    "Home ZIP",
+                    value=default_home,
+                    max_chars=10,
+                    key=f"a_home_zip_{i}",
+                )
+                st.session_state.rows_adv[i]["home_zip"] = home_zip_val
+            with c6:
+                default_dest = row.get("dest_zip", "")
+                if use_global_zips_adv and not default_dest:
+                    default_dest = dest_zip_for_mileage
+                dest_zip_val = st.text_input(
+                    "Dest ZIP",
+                    value=default_dest,
+                    max_chars=10,
+                    key=f"a_dest_zip_{i}",
+                )
+                st.session_state.rows_adv[i]["dest_zip"] = dest_zip_val
+            with c7:
                 if st.button("🗑️", key=f"a_del_{i}", help="Delete this line"):
                     st.session_state.rows_adv.pop(i)
                     st.experimental_rerun()
@@ -558,17 +708,59 @@ with tab_advanced:
         rlas_rows = []
         rlas_total = 0.0
         total_people = 0
-        for row in st.session_state.rows_adv:
+
+        mileage_rows: List[dict] = []
+        mileage_total_cost = 0.0
+        total_miles_roundtrip = 0.0
+
+        for idx, row in enumerate(st.session_state.rows_adv, start=1):
             rank = row["rank"]
             yos = int(row["yos"])
             people = int(row["people"])
+
             rec, line_total = compute_rlas_line_advanced(rank, yos, people, num_trip_days)
+            # If this line came from Excel, we may have a name stored
+            if "name" in row and row["name"]:
+                rec["Name"] = row["name"]
+
             rlas_rows.append(rec)
             rlas_total += line_total
             total_people += people
 
+            # Mileage per line (uses per-line ZIPs if present, else global)
+            home_zip_line = normalize_zip(row.get("home_zip") or origin_zip)
+            dest_zip_line = normalize_zip(row.get("dest_zip") or dest_zip_for_mileage)
+
+            if home_zip_line and dest_zip_line:
+                miles_one_way = zip_distance_miles(home_zip_line, dest_zip_line)
+            else:
+                miles_one_way = None
+
+            if miles_one_way is not None:
+                miles_round_trip = miles_one_way * 2.0
+                # Assumes 1 POV per line; if you want per-person, multiply by `people`.
+                mileage_cost_line = POV_MILE_RATE * miles_round_trip
+
+                mileage_total_cost += mileage_cost_line
+                total_miles_roundtrip += miles_round_trip
+
+                mileage_rows.append(
+                    {
+                        "Line": idx,
+                        "Rank": rank,
+                        "People": people,
+                        "Home ZIP": home_zip_line,
+                        "Dest ZIP": dest_zip_line,
+                        "Miles (one way)": round(miles_one_way, 1),
+                        "Miles (round trip)": round(miles_round_trip, 1),
+                        "Mileage Cost (approx)": round(mileage_cost_line, 2),
+                    }
+                )
+
         rlas_df = pd.DataFrame(rlas_rows)
         rlas_total = round(rlas_total, 2)
+        mileage_total_cost = round(mileage_total_cost, 2)
+        total_miles_roundtrip = round(total_miles_roundtrip, 1)
 
         # --- FY26 per diem per person (seasonal, with 75% rule) ---
         lodging_per_person, mie_per_person = compute_seasonal_per_diem_per_person(
@@ -594,13 +786,16 @@ with tab_advanced:
             rental_total = round(rental_total, 2)
             rental_mode = "Per-line checkboxes (trip days)"
 
-        # --- Mileage (info only) ---
+        # --- Mileage (global info line, optional) ---
         oz = normalize_zip(origin_zip)
         dz = normalize_zip(dest_zip_for_mileage)
-        miles = zip_distance_miles(oz, dz) if (oz and dz) else None
+        miles_global = zip_distance_miles(oz, dz) if (oz and dz) else None
 
         # --- DTS & overall totals ---
-        dts_total = round(mie_total + lodging_total + airfare_total + rental_total, 2)
+        dts_total = round(
+            mie_total + lodging_total + airfare_total + rental_total + mileage_total_cost,
+            2,
+        )
         overall_total = round(rlas_total + dts_total, 2)
 
         # ---------- Display ----------
@@ -627,11 +822,29 @@ with tab_advanced:
             ("Airfare", airfare_total, f"$410 × {int(airfare_count)} traveler(s)"),
             (f"Rental cars ({rental_mode})", rental_total, "$50/car/day"),
         ]
-        if miles is not None and oz and dz:
-            rows.append(("Mileage (info)", 0.0, f"{miles:,.1f} miles from {oz} to {dz}"))
+        if mileage_rows:
+            rows.append(
+                (
+                    "POV Mileage (round trip, approx)",
+                    mileage_total_cost,
+                    f"{total_miles_roundtrip:,.1f} mi × ${POV_MILE_RATE:.2f}/mi (assumes 1 POV per line)",
+                )
+            )
+        if miles_global is not None and oz and dz:
+            rows.append(
+                ("Mileage (info, Global DTS ZIPs)", 0.0, f"{miles_global:,.1f} miles from {oz} to {dz}")
+            )
+
         dts_df = pd.DataFrame(rows, columns=["Component", "Amount", "Notes"])
         dts_df["Amount"] = dts_df["Amount"].round(2)
         st.dataframe(dts_df, use_container_width=True)
+
+        if mileage_rows:
+            st.subheader("Mileage Detail (Advanced)")
+            mileage_df = pd.DataFrame(mileage_rows)
+            st.dataframe(mileage_df, use_container_width=True)
+        else:
+            mileage_df = pd.DataFrame()
 
         # --- Excel export (Advanced) ---
         output = io.BytesIO()
@@ -645,6 +858,8 @@ with tab_advanced:
                 }
             )
             overview.to_excel(writer, index=False, sheet_name="Overview")
+            if not mileage_df.empty:
+                mileage_df.to_excel(writer, index=False, sheet_name="Mileage Detail")
         output.seek(0)
 
         st.download_button(
